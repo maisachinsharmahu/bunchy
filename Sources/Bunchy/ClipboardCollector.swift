@@ -26,10 +26,21 @@ final class ClipboardCollector: ObservableObject {
     private var pollTimer: Timer?
     private var lastSeenChangeCount = NSPasteboard.general.changeCount
 
+    /// Where web-sourced images (raw pixel data with no file reference) get
+    /// written so the final combined paste can offer a real file, not just
+    /// bytes -- see `materializeFileIfNeeded`.
+    private lazy var scratchDirectory: URL = {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Bunchy", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
     func start() {
         items = []
         lastSeenChangeCount = NSPasteboard.general.changeCount
         isCollecting = true
+        try? FileManager.default.removeItem(at: scratchDirectory)
+        try? FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.checkForNewCopy() }
@@ -58,21 +69,75 @@ final class ClipboardCollector: ObservableObject {
         guard let pasteboardItems = pb.pasteboardItems, !pasteboardItems.isEmpty else { return }
 
         for pbItem in pasteboardItems {
-            var representations: [(NSPasteboard.PasteboardType, Data)] = []
-            for type in pbItem.types {
-                if let data = pbItem.data(forType: type) {
-                    representations.append((type, data))
-                }
+            if capture(pbItem) { continue }
+
+            // Some sources -- browsers especially -- announce the
+            // pasteboard's types a moment before the backing data is
+            // actually readable. Rather than silently dropping the item,
+            // give it one short retry against the same live pasteboard
+            // item before giving up.
+            guard !pbItem.types.isEmpty else { continue }
+            let expectedChangeCount = pb.changeCount
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let self, NSPasteboard.general.changeCount == expectedChangeCount else { return }
+                _ = self.capture(pbItem)
             }
-            guard !representations.isEmpty else { continue }
-
-            let fileURL = pbItem.string(forType: .fileURL).flatMap { URL(string: $0) }
-            let name = fileURL?.lastPathComponent ?? "Item \(items.count + 1)"
-            let captured = CollectedItem(representations: representations, thumbnail: nil, displayName: name)
-
-            items.append(captured)
-            loadThumbnail(for: captured.id, fileURL: fileURL, representations: representations)
         }
+    }
+
+    /// Attempts to snapshot one pasteboard item. Returns false (without
+    /// adding anything) if none of its declared types yielded readable data
+    /// yet.
+    @discardableResult
+    private func capture(_ pbItem: NSPasteboardItem) -> Bool {
+        var representations: [(NSPasteboard.PasteboardType, Data)] = []
+        for type in pbItem.types {
+            if let data = pbItem.data(forType: type) {
+                representations.append((type, data))
+            }
+        }
+        guard !representations.isEmpty else { return false }
+
+        var fileURL = pbItem.string(forType: .fileURL).flatMap { URL(string: $0) }
+        materializeFileIfNeeded(representations: &representations, fileURL: &fileURL)
+
+        let name = fileURL?.lastPathComponent ?? "Item \(items.count + 1)"
+        let captured = CollectedItem(representations: representations, thumbnail: nil, displayName: name)
+
+        items.append(captured)
+        loadThumbnail(for: captured.id, fileURL: fileURL, representations: representations)
+        return true
+    }
+
+    /// Web-sourced image copies (e.g. right-click "Copy Image" in Safari or
+    /// Chrome) typically land on the pasteboard as raw TIFF/PNG bytes with
+    /// no `public.file-url` at all -- unlike a Finder copy, which is always
+    /// backed by a real file. Apps that expect a file reference to paste an
+    /// image (Finder itself, Mail, most chat apps) silently fail to paste
+    /// those items even though the raw bytes were captured correctly. Write
+    /// the bytes to a scratch file and add a file-url representation so
+    /// those items paste exactly like a Finder-sourced one.
+    private func materializeFileIfNeeded(representations: inout [(NSPasteboard.PasteboardType, Data)], fileURL: inout URL?) {
+        guard fileURL == nil else { return }
+        guard let (type, data) = representations.first(where: { [.tiff, .png].contains($0.0) }) else { return }
+
+        let ext = type == .png ? "png" : "tiff"
+        let url = scratchDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension(ext)
+        do {
+            try data.write(to: url)
+        } catch {
+            return
+        }
+
+        // Route through a real NSPasteboardItem so the file-url data is
+        // encoded exactly the way `string(forType:)` expects to decode it
+        // when this representation gets replayed later.
+        let encoder = NSPasteboardItem()
+        encoder.setString(url.absoluteString, forType: .fileURL)
+        guard let urlData = encoder.data(forType: .fileURL) else { return }
+
+        representations.append((.fileURL, urlData))
+        fileURL = url
     }
 
     private func loadThumbnail(for id: UUID, fileURL: URL?, representations: [(NSPasteboard.PasteboardType, Data)]) {
